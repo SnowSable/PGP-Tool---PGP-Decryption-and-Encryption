@@ -11,6 +11,7 @@ struct Profile
     std::string email;
     std::string publicKey;
     SecureText privateKey;
+    std::string revocation;
 };
 
 namespace ProfileStore

@@ -222,7 +222,7 @@ namespace Pgp
     }
 
     // yeah basically this loads the recipient's n and e into windows and lets it do PKCS#1 v1.5 padding + encrypt.
-    // gets called from BuildSessionKeyPacket, line 1098 in OpenPgp.cpp
+    // gets called from BuildSessionKeyPacket, line 1123 in OpenPgp.cpp
     Bytes RsaEncrypt(const Bytes& modulus, const Bytes& exponent, const Bytes& message)
     {
         Bytes n = StripLeadingZeros(modulus);
@@ -254,39 +254,58 @@ namespace Pgp
     }
 
     // same deal backwards. windows only needs e, n, p and q and works the rest out itself,
-    // which is why d just gets thrown away in Unlock (OpenPgp.cpp line 1149)
+    // which is why d just gets thrown away in Unlock (OpenPgp.cpp line 1174)
+    namespace
+    {
+        void ImportRsaPrivate(const Bytes& modulus, const Bytes& exponent, const Bytes& prime1, const Bytes& prime2, KeyHandle& key)
+        {
+            Bytes n = StripLeadingZeros(modulus);
+            Bytes e = StripLeadingZeros(exponent);
+            Bytes p = StripLeadingZeros(prime1);
+            Bytes q = StripLeadingZeros(prime2);
+            if (n.empty() || e.empty() || p.empty() || q.empty())
+                throw Error("Invalid RSA private key");
+
+            Bytes blob(sizeof(BCRYPT_RSAKEY_BLOB) + e.size() + n.size() + p.size() + q.size());
+            auto header = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(blob.data());
+            header->Magic = BCRYPT_RSAPRIVATE_MAGIC;
+            header->BitLength = BitLength(n);
+            header->cbPublicExp = static_cast<ULONG>(e.size());
+            header->cbModulus = static_cast<ULONG>(n.size());
+            header->cbPrime1 = static_cast<ULONG>(p.size());
+            header->cbPrime2 = static_cast<ULONG>(q.size());
+            uint8_t* cursor = blob.data() + sizeof(BCRYPT_RSAKEY_BLOB);
+            for (const Bytes* part : { &e, &n, &p, &q })
+            {
+                std::memcpy(cursor, part->data(), part->size());
+                cursor += part->size();
+            }
+
+            NTSTATUS status = BCryptImportKeyPair(RsaProvider(), nullptr, BCRYPT_RSAPRIVATE_BLOB, &key.handle, blob.data(), static_cast<ULONG>(blob.size()), 0);
+            Wipe(blob);
+            Wipe(p);
+            Wipe(q);
+            if (!BCRYPT_SUCCESS(status))
+                throw Error("The RSA private key could not be loaded");
+        }
+
+        bool LessThan(const Bytes& a, const Bytes& b)
+        {
+            if (a.size() != b.size())
+                return a.size() < b.size();
+            return std::memcmp(a.data(), b.data(), a.size()) < 0;
+        }
+    }
+
     Bytes RsaDecrypt(const Bytes& modulus, const Bytes& exponent, const Bytes& prime1, const Bytes& prime2, const Bytes& ciphertext)
     {
         Bytes n = StripLeadingZeros(modulus);
-        Bytes e = StripLeadingZeros(exponent);
-        Bytes p = StripLeadingZeros(prime1);
-        Bytes q = StripLeadingZeros(prime2);
         Bytes c = StripLeadingZeros(ciphertext);
-        if (n.empty() || e.empty() || p.empty() || q.empty() || c.size() > n.size())
-            throw Error("Invalid RSA private key");
-
-        Bytes blob(sizeof(BCRYPT_RSAKEY_BLOB) + e.size() + n.size() + p.size() + q.size());
-        auto header = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(blob.data());
-        header->Magic = BCRYPT_RSAPRIVATE_MAGIC;
-        header->BitLength = BitLength(n);
-        header->cbPublicExp = static_cast<ULONG>(e.size());
-        header->cbModulus = static_cast<ULONG>(n.size());
-        header->cbPrime1 = static_cast<ULONG>(p.size());
-        header->cbPrime2 = static_cast<ULONG>(q.size());
-        uint8_t* cursor = blob.data() + sizeof(BCRYPT_RSAKEY_BLOB);
-        for (const Bytes* part : { &e, &n, &p, &q })
-        {
-            std::memcpy(cursor, part->data(), part->size());
-            cursor += part->size();
-        }
+        if (c.size() > n.size())
+            throw Error("Invalid RSA ciphertext");
 
         KeyHandle key;
-        NTSTATUS status = BCryptImportKeyPair(RsaProvider(), nullptr, BCRYPT_RSAPRIVATE_BLOB, &key.handle, blob.data(), static_cast<ULONG>(blob.size()), 0);
-        Wipe(blob);
-        Wipe(p);
-        Wipe(q);
-        if (!BCRYPT_SUCCESS(status))
-            throw Error("The RSA private key could not be loaded");
+        ImportRsaPrivate(modulus, exponent, prime1, prime2, key);
 
         // bcrypt wants the ciphertext exactly modulus sized, so pad the front with zeros
         Bytes input(n.size() - c.size(), 0);
@@ -297,6 +316,87 @@ namespace Pgp
             throw Error("RSA decryption failed");
         output.resize(written);
         return output;
+    }
+
+    RsaKeyPair::~RsaKeyPair()
+    {
+        Wipe(d);
+        Wipe(p);
+        Wipe(q);
+        Wipe(u);
+    }
+
+    // yeah basically windows makes the key, we export the whole private blob and rearrange it for openpgp.
+    // bcrypt's coefficient is prime2^-1 mod prime1, openpgp wants u = p^-1 mod q with p < q,
+    // so we call prime2 "p" and prime1 "q". only works when prime2 < prime1, so we just reroll until it is
+    // (coin flip, usually 1 or 2 goes) instead of writing big number maths to recompute u
+    RsaKeyPair RsaGenerate(unsigned bits)
+    {
+        for (;;)
+        {
+            KeyHandle key;
+            if (!BCRYPT_SUCCESS(BCryptGenerateKeyPair(RsaProvider(), &key.handle, bits, 0)) || !BCRYPT_SUCCESS(BCryptFinalizeKeyPair(key.handle, 0)))
+                throw Error("RSA key generation failed");
+
+            ULONG size = 0;
+            if (!BCRYPT_SUCCESS(BCryptExportKey(key.handle, nullptr, BCRYPT_RSAFULLPRIVATE_BLOB, nullptr, 0, &size, 0)))
+                throw Error("RSA key export failed");
+            Bytes blob(size);
+            if (!BCRYPT_SUCCESS(BCryptExportKey(key.handle, nullptr, BCRYPT_RSAFULLPRIVATE_BLOB, blob.data(), size, &size, 0)))
+                throw Error("RSA key export failed");
+
+            BCRYPT_RSAKEY_BLOB header;
+            std::memcpy(&header, blob.data(), sizeof(header));
+            const uint8_t* cursor = blob.data() + sizeof(header);
+            auto take = [&cursor](ULONG count)
+            {
+                Bytes part(cursor, cursor + count);
+                cursor += count;
+                return part;
+            };
+
+            RsaKeyPair pair;
+            pair.e = StripLeadingZeros(take(header.cbPublicExp));
+            pair.n = StripLeadingZeros(take(header.cbModulus));
+            Bytes prime1 = take(header.cbPrime1);
+            Bytes prime2 = take(header.cbPrime2);
+            Bytes exponent1 = take(header.cbPrime1);
+            Bytes exponent2 = take(header.cbPrime2);
+            Bytes coefficient = take(header.cbPrime1);
+            Bytes privateExponent = take(header.cbModulus);
+            Wipe(blob);
+            Wipe(exponent1);
+            Wipe(exponent2);
+
+            pair.p = StripLeadingZeros(prime2);
+            pair.q = StripLeadingZeros(prime1);
+            pair.u = StripLeadingZeros(coefficient);
+            pair.d = StripLeadingZeros(privateExponent);
+            Wipe(prime1);
+            Wipe(prime2);
+            Wipe(coefficient);
+            Wipe(privateExponent);
+
+            if (LessThan(pair.p, pair.q))
+                return pair;
+        }
+    }
+
+    Bytes RsaSignSha256(const RsaKeyPair& pair, const Bytes& digest)
+    {
+        if (digest.size() != 32)
+            throw Error("Invalid SHA-256 digest");
+
+        KeyHandle key;
+        ImportRsaPrivate(pair.n, pair.e, pair.p, pair.q, key);
+
+        BCRYPT_PKCS1_PADDING_INFO padding = { BCRYPT_SHA256_ALGORITHM };
+        Bytes signature(StripLeadingZeros(pair.n).size());
+        ULONG written = 0;
+        if (!BCRYPT_SUCCESS(BCryptSignHash(key.handle, &padding, const_cast<PUCHAR>(digest.data()), static_cast<ULONG>(digest.size()), signature.data(), static_cast<ULONG>(signature.size()), &written, BCRYPT_PAD_PKCS1)))
+            throw Error("RSA signing failed");
+        signature.resize(written);
+        return signature;
     }
 
     void WipeMemory(void* data, size_t size)

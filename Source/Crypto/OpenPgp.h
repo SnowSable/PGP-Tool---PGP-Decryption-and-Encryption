@@ -42,4 +42,24 @@ namespace Pgp
     DecryptResult DecryptMessage(std::string_view message, std::string_view privateKey, std::string_view passphrase);
     // the My PGP tab uses this to check what got pasted before saving it
     KeyInfo InspectKey(std::string_view armored);
+    std::string RevocationKeyId(std::string_view text);
+
+    struct GeneratedKey
+    {
+        std::string userId;
+        std::string fingerprint;
+        std::string publicKey;
+        std::string privateKey;
+        std::string revocation;
+
+        GeneratedKey() = default;
+        GeneratedKey(GeneratedKey&&) = default;
+        GeneratedKey& operator=(GeneratedKey&&) = default;
+        ~GeneratedKey()
+        {
+            Wipe(privateKey);
+        }
+    };
+
+    GeneratedKey GenerateKey(std::string_view name, std::string_view email, std::string_view passphrase);
 }

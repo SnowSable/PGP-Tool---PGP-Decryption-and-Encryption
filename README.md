@@ -18,7 +18,15 @@ no gpg install, no kleopatra, no 400 menu options. it's one exe.
 
 ![Passphrase popup](Source/Docs/Screenshots/Passphrase.png)
 
-**My PGP** – save your name, email and keys so you don't have to paste your private key every single time. once it's saved, a **Use Saved Key** button shows up on the Decrypt tab.
+**Generate PGP** – don't have a key yet? put in your name, email and a passphrase and hit Generate Keys. you get a public key, a private key and a revocation certificate, then **Download** drops all three into your Downloads folder as .txt files, and **Save All** puts all of it straight into My PGP so it's there every time you open the app.
+
+![Generate PGP tab](Source/Docs/Screenshots/Generate.png)
+
+the keys are RSA-3072 (same as gpg's RSA default), one key for signing plus an encryption subkey, private key locked with your passphrase. they import straight into gpg / kleopatra.
+
+the revocation certificate is your "kill switch" if the private key ever gets lost or stolen. it has a `:` in front of the BEGIN line so it can't get imported by accident, delete the colon when you actually need to use it.
+
+**My PGP** – save your name, email, keys and revocation certificate so you don't have to paste your private key every single time. once it's saved, a **Use Saved Key** button shows up on the Decrypt tab. it stays saved until you hit **Clear**. it checks the revocation certificate actually belongs to your key before saving, so you can't mix them up.
 
 ![My PGP tab](Source/Docs/Screenshots/MyPgp.png)
 
@@ -109,11 +117,13 @@ Source/
 if you're poking around:
 
 - `Crypto/OpenPgp.cpp` is the big one. packet parsing, keys, encrypt/decrypt all live there. `EncryptMessage` and `DecryptMessage` at the bottom are where the buttons end up.
-- `Crypto/Primitives.cpp` is the windows bcrypt wrapper (AES, SHA, RSA, random).
+- `Crypto/Primitives.cpp` is the windows bcrypt wrapper (AES, SHA, RSA keygen / sign / encrypt, random).
 - `Crypto/Curve25519.cpp` is the x25519 math (tweetnacl port).
 - `Crypto/Inflate.cpp` unzips gpg's compressed messages.
 - `App/Application.cpp` is every bit of UI.
 - `App/ProfileStore.cpp` is the DPAPI + registry saving.
+- `App/FileExport.cpp` is the Download button, writes the .txt files into Downloads.
+- key generation is `GenerateKey` at the very bottom of `Crypto/OpenPgp.cpp`, RSA keygen + signing is in `Crypto/Primitives.cpp`.
 
 the comments in the code point at each other with line numbers if you want to follow something through.
 

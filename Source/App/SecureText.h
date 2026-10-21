@@ -6,7 +6,7 @@
 
 // a text buffer that zeroes itself whenever it grows, gets cleared or dies.
 // std::string can't do that, it reallocates and leaves the old copy lying in freed memory.
-// imgui writes straight into it through the resize callback in Application.cpp line 96
+// imgui writes straight into it through the resize callback in Application.cpp line 103
 class SecureText
 {
 public:

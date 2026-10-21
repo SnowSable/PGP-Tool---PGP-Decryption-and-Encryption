@@ -18,8 +18,10 @@ namespace
     constexpr wchar_t BlobDescription[] = L"PGP Tool profile";
     // extra secret input to DPAPI, another app calling CryptUnprotectData on our blob would need this too
     constexpr char Entropy[] = "PGPTool.Profile.v1";
-    // 'PGT' + version 1 at the start of the decrypted blob so we know it's ours and can change the format later
-    constexpr uint8_t Magic[4] = { 'P', 'G', 'T', 1 };
+    // 'PGT' + a version byte at the start of the decrypted blob so we know it's ours.
+    // v1 had name/email/public/private, v2 tacked the revocation certificate on the end. we still read v1
+    constexpr uint8_t Magic[3] = { 'P', 'G', 'T' };
+    constexpr uint8_t FormatVersion = 2;
 
     class LocalBlob
     {
@@ -114,32 +116,39 @@ namespace ProfileStore
 
         const uint8_t* data = output.blob.pbData;
         size_t length = output.blob.cbData;
-        if (length < sizeof(Magic) || std::memcmp(data, Magic, sizeof(Magic)) != 0)
+        if (length < sizeof(Magic) + 1 || std::memcmp(data, Magic, sizeof(Magic)) != 0)
             throw std::runtime_error("The saved information is damaged");
+        uint8_t version = data[sizeof(Magic)];
+        if (version < 1 || version > FormatVersion)
+            throw std::runtime_error("The saved information was made by a newer version of PGP Tool");
 
-        size_t position = sizeof(Magic);
+        size_t position = sizeof(Magic) + 1;
         std::string_view name = ReadField(data, length, position);
         std::string_view email = ReadField(data, length, position);
         std::string_view publicKey = ReadField(data, length, position);
         std::string_view privateKey = ReadField(data, length, position);
+        std::string_view revocation = version >= 2 ? ReadField(data, length, position) : std::string_view();
 
         profile.name.assign(name);
         profile.email.assign(email);
         profile.publicKey.assign(publicKey);
         profile.privateKey.Assign(privateKey);
+        profile.revocation.assign(revocation);
         return true;
     }
 
-    // yeah basically this packs name/email/public/private into one length-prefixed blob,
+    // yeah basically this packs name/email/public/private/revocation into one length-prefixed blob,
     // encrypts it with DPAPI tied to your windows login and dumps it in the registry
     void Save(const Profile& profile)
     {
         Pgp::Bytes plain(Magic, Magic + sizeof(Magic));
-        plain.reserve(sizeof(Magic) + 16 + profile.name.size() + profile.email.size() + profile.publicKey.size() + profile.privateKey.Size());
+        plain.push_back(FormatVersion);
+        plain.reserve(sizeof(Magic) + 21 + profile.name.size() + profile.email.size() + profile.publicKey.size() + profile.privateKey.Size() + profile.revocation.size());
         WriteField(plain, profile.name);
         WriteField(plain, profile.email);
         WriteField(plain, profile.publicKey);
         WriteField(plain, profile.privateKey.View());
+        WriteField(plain, profile.revocation);
 
         DATA_BLOB input = { static_cast<DWORD>(plain.size()), plain.data() };
         DATA_BLOB entropy = EntropyBlob();
