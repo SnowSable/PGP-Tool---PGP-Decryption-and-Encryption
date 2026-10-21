@@ -55,7 +55,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)App;$(ProjectDir)Crypto;$(ProjectDir)Vendor\ImGui;$(ProjectDir)Vendor\ImGui\Backends;$(ProjectDir)Vendor\ImGui\Misc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)App;$(ProjectDir)Crypto;$(ProjectDir)Resources;$(ProjectDir)Vendor\ImGui;$(ProjectDir)Vendor\ImGui\Backends;$(ProjectDir)Vendor\ImGui\Misc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
@@ -106,6 +106,7 @@
     <ClCompile Include="Vendor\ImGui\Misc\imgui_stdlib.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Resources\Resource.h" />
     <ClInclude Include="App\Application.h" />
     <ClInclude Include="App\ProfileStore.h" />
     <ClInclude Include="App\SecureText.h" />
@@ -124,6 +125,12 @@
     <ClInclude Include="Vendor\ImGui\Backends\imgui_impl_dx11.h" />
     <ClInclude Include="Vendor\ImGui\Backends\imgui_impl_win32.h" />
     <ClInclude Include="Vendor\ImGui\Misc\imgui_stdlib.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Resources\App.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Resources\App.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

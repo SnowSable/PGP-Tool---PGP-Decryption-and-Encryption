@@ -1,4 +1,5 @@
 #include "Application.h"
+#include "Resource.h"
 #include "Theme.h"
 
 #include "imgui.h"
@@ -163,6 +164,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     windowClass.style = CS_CLASSDC;
     windowClass.lpfnWndProc = WindowProcedure;
     windowClass.hInstance = instance;
+    // big one for alt-tab, small one for the title bar. asking for the exact system sizes so windows doesn't blur a scaled one
+    windowClass.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     windowClass.lpszClassName = WindowClass;
