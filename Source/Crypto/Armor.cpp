@@ -119,10 +119,13 @@ namespace Pgp
     }
 
     // wraps binary in the -----BEGIN PGP----- base64 thing, 64 chars a line like gpg does
-    std::string Armor(const Bytes& data, const std::string& type)
+    std::string Armor(const Bytes& data, const std::string& type, const std::string& comment)
     {
         std::string encoded = Base64Encode(data);
-        std::string out = "-----BEGIN " + type + "-----\n\n";
+        std::string out = "-----BEGIN " + type + "-----\n";
+        if (!comment.empty())
+            out += "Comment: " + comment + "\n";
+        out += "\n";
         for (size_t i = 0; i < encoded.size(); i += 64)
             out += encoded.substr(i, 64) + "\n";
         uint32_t crc = Crc24(data);

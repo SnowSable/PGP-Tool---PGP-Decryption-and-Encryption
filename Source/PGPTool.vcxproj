@@ -88,6 +88,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="App\Application.cpp" />
+    <ClCompile Include="App\FileExport.cpp" />
     <ClCompile Include="App\Main.cpp" />
     <ClCompile Include="App\ProfileStore.cpp" />
     <ClCompile Include="App\SecureText.cpp" />
@@ -108,6 +109,7 @@
   <ItemGroup>
     <ClInclude Include="Resources\Resource.h" />
     <ClInclude Include="App\Application.h" />
+    <ClInclude Include="App\FileExport.h" />
     <ClInclude Include="App\ProfileStore.h" />
     <ClInclude Include="App\SecureText.h" />
     <ClInclude Include="App\Theme.h" />

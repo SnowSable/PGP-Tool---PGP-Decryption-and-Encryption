@@ -6,7 +6,12 @@
 #include "imgui_internal.h"
 #include "imgui_stdlib.h"
 
+#include "FileExport.h"
+
 #include <algorithm>
+#include <chrono>
+#include <iterator>
+#include <memory>
 
 namespace
 {
@@ -14,11 +19,13 @@ namespace
     {
         ActionNone,
         ActionPrimary,
-        ActionSecondary
+        ActionSecondary,
+        ActionTertiary
     };
 
     constexpr const char* PassphrasePopup = "Passphrase Required";
     constexpr const char* ClearPopup = "Clear Saved Information";
+    constexpr const char* ReplacePopup = "Replace Saved Information";
     constexpr double CopiedDuration = 1.6;
 
     // all the layout magic numbers live here so you can tweak the look without hunting through the file
@@ -145,9 +152,13 @@ Application::~Application()
     ResetDecrypt();
     Pgp::Wipe(profile.publicKey);
     profile.privateKey.Clear();
+    generatePassphrase.Clear();
+    generateConfirm.Clear();
+    if (generating.valid())
+        generating.wait();
 }
 
-// one full-window imgui window with the 3 tabs. runs every frame from Main.cpp line 259
+// one full-window imgui window with the 4 tabs. runs every frame from Main.cpp line 263
 void Application::Render()
 {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -168,6 +179,7 @@ void Application::Render()
         const Tab tabs[] = {
             { "Encrypt", &Application::RenderEncryptTab },
             { "Decrypt", &Application::RenderDecryptTab },
+            { "Generate PGP", &Application::RenderGenerateTab },
             { "My PGP", &Application::RenderProfileTab },
         };
 
@@ -187,6 +199,7 @@ void Application::Render()
 
     RenderPassphrasePopup();
     RenderClearPopup();
+    RenderReplacePopup();
     ImGui::End();
 }
 
@@ -261,7 +274,232 @@ void Application::RenderDecryptTab()
     OutputPanel("##DecryptedOutput", "DECRYPTED MESSAGE", decryptedOutput, decryptCopiedAt, outputHeight, false, "The decrypted message will appear here");
 }
 
-// the My PGP tab. name/email up top, keys side by side, save/clear at the bottom
+// the Generate PGP tab. name/email/passphrase on top, buttons, then public / private / revocation side by side.
+// the actual generating happens on a background thread, FinishGenerate checks every frame if it's done yet
+void Application::RenderGenerateTab()
+{
+    FinishGenerate();
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::Dummy(ImVec2(0.0f, TopSpacing * Scale()));
+
+    float columnWidth = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) * 0.5f;
+    bool busy = generating.valid();
+
+    ImGui::BeginDisabled(busy);
+    ImGui::BeginGroup();
+    Label("NAME");
+    ImGui::SetNextItemWidth(columnWidth);
+    ImGui::InputTextWithHint("##GenerateName", "Your name", &generateName);
+    ImGui::EndGroup();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    Label("EMAIL");
+    ImGui::SetNextItemWidth(columnWidth);
+    ImGui::InputTextWithHint("##GenerateEmail", "you@example.com", &generateEmail);
+    ImGui::EndGroup();
+
+    ImGui::BeginGroup();
+    Label("PASSPHRASE");
+    PasswordField("##GeneratePassphrase", generatePassphrase, columnWidth, "Protects your private key");
+    ImGui::EndGroup();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    Label("CONFIRM PASSPHRASE");
+    PasswordField("##GenerateConfirm", generateConfirm, columnWidth, "Type it again");
+    ImGui::EndGroup();
+    ImGui::EndDisabled();
+
+    ImGui::Dummy(ImVec2(0.0f, style.ItemSpacing.y * 0.5f));
+    const char* generateLabel = busy ? "Generating...###Generate" : "Generate Keys###Generate";
+    bool ready = !busy && !generated.publicKey.empty();
+    int action = ActionButtons(generateLabel, "Download", generateStatus, !busy, ready, "Save All", ready);
+    if (action == ActionPrimary)
+        StartGenerate();
+    else if (action == ActionSecondary)
+        DownloadKeys();
+    else if (action == ActionTertiary)
+        SaveGenerated();
+    ImGui::Dummy(ImVec2(0.0f, style.ItemSpacing.y * 0.5f));
+
+    struct Output
+    {
+        const char* label;
+        const char* id;
+        std::string* text;
+        double* copiedAt;
+        const char* placeholder;
+    };
+    const Output outputs[] = {
+        { "PUBLIC KEY", "##GeneratedPublic", &generated.publicKey, &generatedPublicCopiedAt, "Your public key will appear here. This is the one you give to people" },
+        { "PRIVATE KEY", "##GeneratedPrivate", &generated.privateKey, &generatedPrivateCopiedAt, "Your private key will appear here. Never share this one" },
+        { "REVOCATION CERTIFICATE", "##GeneratedRevocation", &generated.revocation, &generatedRevocationCopiedAt, "Your revocation certificate will appear here. Keep it somewhere safe" },
+    };
+
+    float outputWidth = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x * 2.0f) / 3.0f;
+    float outputHeight = std::max(ImGui::GetContentRegionAvail().y - LabelBlockHeight(), MinimumBoxHeight * Scale());
+    for (size_t i = 0; i < std::size(outputs); ++i)
+    {
+        const Output& output = outputs[i];
+        if (i)
+            ImGui::SameLine();
+        ImGui::BeginGroup();
+        bool copied = ImGui::GetTime() - *output.copiedAt < CopiedDuration;
+        if (Header(output.label, outputWidth, copied ? "Copied###Copy" : "Copy###Copy", "Copied", !output.text->empty()))
+        {
+            CopyToClipboard(*output.text);
+            *output.copiedAt = ImGui::GetTime();
+        }
+        // no wrapping here, 3 columns are too narrow for 64 char armor lines so they scroll sideways instead of breaking
+        TextBox(output.id, *output.text, outputWidth, outputHeight, true, true, output.placeholder, false);
+        ImGui::EndGroup();
+    }
+}
+
+// checks the form and kicks off generation on a background thread so the window keeps drawing.
+// the passphrase goes over in a shared_ptr so there's exactly one copy of it, which the thread wipes when done
+void Application::StartGenerate()
+{
+    if (generating.valid())
+        return;
+    if (IsBlank(generateName) && IsBlank(generateEmail))
+    {
+        generateStatus = { "Enter a name or email for the key", StatusKind::Failure };
+        return;
+    }
+    if (!IsBlank(generateEmail) && generateEmail.find('@') == std::string::npos)
+    {
+        generateStatus = { "That email doesn't look right", StatusKind::Failure };
+        return;
+    }
+    if (generatePassphrase.View() != generateConfirm.View())
+    {
+        generateStatus = { "The passphrases don't match", StatusKind::Failure };
+        return;
+    }
+
+    auto secret = std::make_shared<std::string>(generatePassphrase.View());
+    std::string name = generateName;
+    std::string email = generateEmail;
+    generating = std::async(std::launch::async, [name, email, secret]()
+    {
+        try
+        {
+            Pgp::GeneratedKey key = Pgp::GenerateKey(name, email, *secret);
+            Pgp::Wipe(*secret);
+            return key;
+        }
+        catch (...)
+        {
+            Pgp::Wipe(*secret);
+            throw;
+        }
+    });
+    generateStatus = { "Generating a 3072-bit RSA key pair...", StatusKind::None };
+}
+
+void Application::FinishGenerate()
+{
+    if (!generating.valid() || generating.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+
+    try
+    {
+        generated = generating.get();
+        generatedPublicCopiedAt = generatedPrivateCopiedAt = generatedRevocationCopiedAt = -10.0;
+        if (generatePassphrase.Empty())
+            generateStatus = { "Generated with no passphrase, anyone who gets the private key can use it", StatusKind::None };
+        else
+            generateStatus = { "Generated  \xC2\xB7  " + generated.fingerprint, StatusKind::Success };
+    }
+    catch (const std::exception& error)
+    {
+        generateStatus = { error.what(), StatusKind::Failure };
+    }
+    generatePassphrase.Clear();
+    generateConfirm.Clear();
+}
+
+// the Download button. drops the 3 .txt files into Downloads (FileExport.cpp) and opens explorer with them selected
+void Application::DownloadKeys()
+{
+    if (generated.publicKey.empty())
+        return;
+
+    std::string name;
+    std::string email;
+    SplitUserId(generated.userId, name, email);
+    std::string base = FileExport::SafeFileName(name.empty() ? email : name);
+    if (base.empty())
+        base = "PGP";
+
+    std::vector<FileExport::File> files = {
+        { base + " - Public Key.txt", generated.publicKey },
+        { base + " - Private Key.txt", generated.privateKey },
+        { base + " - Revocation Certificate.txt", generated.revocation },
+    };
+    try
+    {
+        std::vector<std::wstring> paths = FileExport::SaveToDownloads(files);
+        FileExport::ShowInExplorer(paths.front());
+        generateStatus = { "Saved 3 files to your Downloads folder", StatusKind::Success };
+    }
+    catch (const std::exception& error)
+    {
+        generateStatus = { error.what(), StatusKind::Failure };
+    }
+    Pgp::Wipe(files[1].contents);
+}
+
+// the Save All button. if there's already something in My PGP we ask first (RenderReplacePopup),
+// otherwise it goes straight in
+void Application::SaveGenerated()
+{
+    if (generated.publicKey.empty())
+        return;
+    if (hasSavedProfile)
+        replaceRequested = true;
+    else
+        StoreGenerated();
+}
+
+// copies everything from the Generate tab into My PGP and saves it for good (well, until Clear in My PGP).
+// saves a separate Profile first so the My PGP form only changes if the save actually worked
+void Application::StoreGenerated()
+{
+    std::string name;
+    std::string email;
+    SplitUserId(generated.userId, name, email);
+
+    Profile saved;
+    saved.name = name;
+    saved.email = email;
+    saved.publicKey = generated.publicKey;
+    saved.privateKey.Assign(generated.privateKey);
+    saved.revocation = generated.revocation;
+    try
+    {
+        ProfileStore::Save(saved);
+    }
+    catch (const std::exception& error)
+    {
+        generateStatus = { error.what(), StatusKind::Failure };
+        return;
+    }
+
+    profile.name = saved.name;
+    profile.email = saved.email;
+    Pgp::Wipe(profile.publicKey);
+    profile.publicKey = saved.publicKey;
+    profile.privateKey.Assign(saved.privateKey.View());
+    profile.revocation = saved.revocation;
+    hasSavedProfile = true;
+    hasSavedPrivateKey = true;
+    generateStatus = { "Saved to My PGP", StatusKind::Success };
+    profileStatus = { "Saved from Generate PGP  \xC2\xB7  " + generated.fingerprint, StatusKind::Success };
+}
+
+// the My PGP tab. name/email up top, then public / private / revocation side by side, save/clear at the bottom
 void Application::RenderProfileTab()
 {
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -284,20 +522,32 @@ void Application::RenderProfileTab()
     ImGui::Dummy(ImVec2(0.0f, style.ItemSpacing.y * 0.5f));
     float reserved = LabelBlockHeight() + ActionButtonHeight() + style.ItemSpacing.y * 3.0f;
     float keyHeight = std::max(ImGui::GetContentRegionAvail().y - reserved, MinimumBoxHeight * Scale());
+    float keyWidth = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x * 2.0f) / 3.0f;
 
+    // same 3 column layout as the Generate tab, no wrapping so armor lines don't get chopped up
     ImGui::BeginGroup();
     bool copied = ImGui::GetTime() - profileCopiedAt < CopiedDuration;
-    if (Header("PUBLIC KEY", columnWidth, copied ? "Copied###Copy" : "Copy###Copy", "Copied", !IsBlank(profile.publicKey)))
+    if (Header("PUBLIC KEY", keyWidth, copied ? "Copied###Copy" : "Copy###Copy", "Copied", !IsBlank(profile.publicKey)))
     {
         CopyToClipboard(profile.publicKey);
         profileCopiedAt = ImGui::GetTime();
     }
-    TextBox("##ProfilePublicKey", profile.publicKey, columnWidth, keyHeight, false, true, "Paste your public key\n-----BEGIN PGP PUBLIC KEY BLOCK-----");
+    TextBox("##ProfilePublicKey", profile.publicKey, keyWidth, keyHeight, false, true, "Paste your public key\n-----BEGIN PGP PUBLIC KEY BLOCK-----", false);
     ImGui::EndGroup();
     ImGui::SameLine();
     ImGui::BeginGroup();
     Label("PRIVATE KEY");
-    TextBox("##ProfilePrivateKey", profile.privateKey, columnWidth, keyHeight, true, "Paste your private key\n-----BEGIN PGP PRIVATE KEY BLOCK-----");
+    TextBox("##ProfilePrivateKey", profile.privateKey, keyWidth, keyHeight, true, "Paste your private key\n-----BEGIN PGP PRIVATE KEY BLOCK-----", false);
+    ImGui::EndGroup();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    bool revocationCopied = ImGui::GetTime() - profileRevocationCopiedAt < CopiedDuration;
+    if (Header("REVOCATION CERTIFICATE", keyWidth, revocationCopied ? "Copied###Copy" : "Copy###Copy", "Copied", !IsBlank(profile.revocation)))
+    {
+        CopyToClipboard(profile.revocation);
+        profileRevocationCopiedAt = ImGui::GetTime();
+    }
+    TextBox("##ProfileRevocation", profile.revocation, keyWidth, keyHeight, false, true, "Paste your revocation certificate\n:-----BEGIN PGP PUBLIC KEY BLOCK-----", false);
     ImGui::EndGroup();
 
     ImGui::Dummy(ImVec2(0.0f, style.ItemSpacing.y * 0.5f));
@@ -306,6 +556,14 @@ void Application::RenderProfileTab()
         SaveProfile();
     else if (action == ActionSecondary)
         ClearProfile();
+}
+
+// single line password box backed by a SecureText, same resize trick as the big text boxes
+void Application::PasswordField(const char* id, SecureText& text, float width, const char* hint)
+{
+    ImGui::SetNextItemWidth(width);
+    ImGui::InputTextWithHint(id, hint, text.Data(), text.Capacity(), ImGuiInputTextFlags_Password | ImGuiInputTextFlags_CallbackResize, ResizeSecureText, &text);
+    text.Sync();
 }
 
 // shared setup for both popups. 'requested' is our own flag, imgui wants popups opened
@@ -383,6 +641,43 @@ void Application::RenderPassphrasePopup()
     ImGui::EndPopup();
 }
 
+void Application::RenderReplacePopup()
+{
+    if (!BeginModal(ReplacePopup, replaceRequested))
+        return;
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("You already have PGP information saved in My PGP. Saving these keys replaces all of it.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0.0f, PopupGap * Scale()));
+
+    float buttonWidth = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) * 0.5f;
+    float buttonHeight = ImGui::GetFrameHeight() * 1.1f;
+
+    Theme::PushPrimaryButton();
+    bool confirm = ImGui::Button("Replace", ImVec2(buttonWidth, buttonHeight));
+    Theme::PopButton();
+    ImGui::SameLine();
+    Theme::PushSecondaryButton();
+    bool cancel = ImGui::Button("Cancel", ImVec2(buttonWidth, buttonHeight));
+    Theme::PopButton();
+
+    if (confirm)
+    {
+        StoreGenerated();
+        replaceRequested = false;
+        ImGui::CloseCurrentPopup();
+    }
+    else if (cancel || ImGui::IsKeyPressed(ImGuiKey_Escape))
+    {
+        replaceRequested = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
 void Application::RenderClearPopup()
 {
     if (!BeginModal(ClearPopup, clearRequested))
@@ -390,7 +685,7 @@ void Application::RenderClearPopup()
 
     const ImGuiStyle& style = ImGui::GetStyle();
     ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
-    ImGui::TextWrapped("This permanently deletes your saved name, email and keys from this computer.");
+    ImGui::TextWrapped("This permanently deletes your saved name, email, keys and revocation certificate from this computer.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0.0f, PopupGap * Scale()));
 
@@ -414,6 +709,7 @@ void Application::RenderClearPopup()
             Pgp::Wipe(profile.email);
             Pgp::Wipe(profile.publicKey);
             profile.privateKey.Clear();
+            Pgp::Wipe(profile.revocation);
             hasSavedProfile = false;
             hasSavedPrivateKey = false;
             profileStatus = { "Saved information cleared", StatusKind::Success };
@@ -514,12 +810,13 @@ void Application::UseSavedKey()
 }
 
 // makes sure the keys make sense before saving: right type in each box, same key pair, then fills
-// name/email from the key if you left them blank. the actual saving is ProfileStore.cpp line 135
+// name/email from the key if you left them blank. the actual saving is ProfileStore.cpp line 142
 void Application::SaveProfile()
 {
     bool hasPublic = !IsBlank(profile.publicKey);
     bool hasPrivate = !IsBlank(profile.privateKey.View());
-    if (!hasPublic && !hasPrivate && IsBlank(profile.name) && IsBlank(profile.email))
+    bool hasRevocation = !IsBlank(profile.revocation);
+    if (!hasPublic && !hasPrivate && !hasRevocation && IsBlank(profile.name) && IsBlank(profile.email))
     {
         profileStatus = { "Nothing to save, fill in at least one field", StatusKind::Failure };
         return;
@@ -565,6 +862,25 @@ void Application::SaveProfile()
     }
 
     const Pgp::KeyInfo& info = hasPrivate ? privateInfo : publicInfo;
+    if (hasRevocation)
+    {
+        std::string revokedKeyId;
+        try
+        {
+            revokedKeyId = Pgp::RevocationKeyId(profile.revocation);
+        }
+        catch (const std::exception& error)
+        {
+            profileStatus = { std::string("Revocation certificate: ") + error.what(), StatusKind::Failure };
+            return;
+        }
+        if (!info.keyId.empty() && revokedKeyId != info.keyId)
+        {
+            profileStatus = { "The revocation certificate is for a different key", StatusKind::Failure };
+            return;
+        }
+    }
+
     if (!info.userId.empty() && (IsBlank(profile.name) || IsBlank(profile.email)))
     {
         std::string name;
@@ -603,6 +919,7 @@ void Application::ClearProfile()
     Pgp::Wipe(profile.email);
     Pgp::Wipe(profile.publicKey);
     profile.privateKey.Clear();
+    Pgp::Wipe(profile.revocation);
     profileStatus = {};
 }
 
@@ -670,9 +987,9 @@ bool Application::Header(const char* label, float width, const char* button, con
     return clicked;
 }
 
-void Application::TextBox(const char* id, std::string& text, float width, float height, bool readOnly, bool mono, const char* placeholder)
+void Application::TextBox(const char* id, std::string& text, float width, float height, bool readOnly, bool mono, const char* placeholder, bool wrap)
 {
-    ImGuiInputTextFlags flags = ImGuiInputTextFlags_WordWrap;
+    ImGuiInputTextFlags flags = wrap ? ImGuiInputTextFlags_WordWrap : ImGuiInputTextFlags_None;
     if (readOnly)
         flags |= ImGuiInputTextFlags_ReadOnly;
 
@@ -684,9 +1001,11 @@ void Application::TextBox(const char* id, std::string& text, float width, float 
     Placeholder(text.empty(), width, placeholder);
 }
 
-void Application::TextBox(const char* id, SecureText& text, float width, float height, bool mono, const char* placeholder)
+void Application::TextBox(const char* id, SecureText& text, float width, float height, bool mono, const char* placeholder, bool wrap)
 {
-    ImGuiInputTextFlags flags = ImGuiInputTextFlags_WordWrap | ImGuiInputTextFlags_CallbackResize;
+    ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackResize;
+    if (wrap)
+        flags |= ImGuiInputTextFlags_WordWrap;
 
     if (mono)
         ImGui::PushFont(fonts.mono, Theme::MonoSize);
@@ -721,24 +1040,40 @@ void Application::OutputPanel(const char* id, const char* label, std::string& te
     TextBox(id, text, width, height, true, mono, placeholder);
 }
 
-int Application::ActionButtons(const char* primary, const char* secondary, const Status& status)
+int Application::ActionButtons(const char* primary, const char* secondary, const Status& status, bool primaryEnabled, bool secondaryEnabled, const char* tertiary, bool tertiaryEnabled)
 {
     const ImGuiStyle& style = ImGui::GetStyle();
     float height = ActionButtonHeight();
-    float primaryWidth = std::max(ImGui::CalcTextSize(primary).x + style.FramePadding.x * ActionButtonPadding, PrimaryButtonWidth * Scale());
-    float secondaryWidth = std::max(ImGui::CalcTextSize(secondary).x + style.FramePadding.x * ActionButtonPadding, SecondaryButtonWidth * Scale());
+    float primaryWidth = std::max(ImGui::CalcTextSize(primary, nullptr, true).x + style.FramePadding.x * ActionButtonPadding, PrimaryButtonWidth * Scale());
+    float secondaryWidth = std::max(ImGui::CalcTextSize(secondary, nullptr, true).x + style.FramePadding.x * ActionButtonPadding, SecondaryButtonWidth * Scale());
 
     int action = ActionNone;
+    ImGui::BeginDisabled(!primaryEnabled);
     Theme::PushPrimaryButton();
     if (ImGui::Button(primary, ImVec2(primaryWidth, height)))
         action = ActionPrimary;
     Theme::PopButton();
+    ImGui::EndDisabled();
 
     ImGui::SameLine();
+    ImGui::BeginDisabled(!secondaryEnabled);
     Theme::PushSecondaryButton();
     if (ImGui::Button(secondary, ImVec2(secondaryWidth, height)))
         action = ActionSecondary;
     Theme::PopButton();
+    ImGui::EndDisabled();
+
+    if (tertiary)
+    {
+        float tertiaryWidth = std::max(ImGui::CalcTextSize(tertiary, nullptr, true).x + style.FramePadding.x * ActionButtonPadding, SecondaryButtonWidth * Scale());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!tertiaryEnabled);
+        Theme::PushSecondaryButton();
+        if (ImGui::Button(tertiary, ImVec2(tertiaryWidth, height)))
+            action = ActionTertiary;
+        Theme::PopButton();
+        ImGui::EndDisabled();
+    }
 
     if (status.kind != StatusKind::None || !status.text.empty())
     {

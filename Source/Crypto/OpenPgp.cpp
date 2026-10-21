@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <initializer_list>
 
 namespace Pgp
 {
@@ -138,7 +139,7 @@ namespace Pgp
         };
 
         // one primary key or subkey out of a key block. always has the public bits,
-        // only has the secret bits after Unlock (line 1149) has run
+        // only has the secret bits after Unlock (line 1174) has run
         struct Key
         {
             int version = 0;
@@ -212,6 +213,15 @@ namespace Pgp
         bool IsBlank(std::string_view text)
         {
             return text.find_first_not_of(" \t\r\n") == std::string_view::npos;
+        }
+
+        std::string_view Trim(std::string_view text)
+        {
+            size_t start = text.find_first_not_of(" \t\r\n");
+            if (start == std::string_view::npos)
+                return {};
+            size_t end = text.find_last_not_of(" \t\r\n");
+            return text.substr(start, end - start + 1);
         }
 
         std::string Hex(const Bytes& data)
@@ -406,6 +416,15 @@ namespace Pgp
             out.insert(out.end(), value.begin() + start, value.end());
         }
 
+        // keys get hashed as 0x99, a 2 byte length, then the public key body. fingerprints and every
+        // signature over a key (cert, subkey binding, revocation) use this exact format
+        Bytes KeyHashPrefix(const uint8_t* publicBody, size_t size)
+        {
+            Bytes out = { 0x99, static_cast<uint8_t>(size >> 8), static_cast<uint8_t>(size) };
+            out.insert(out.end(), publicBody, publicBody + size);
+            return out;
+        }
+
         Bytes PadLeft(const Bytes& value, size_t size)
         {
             if (value.size() >= size)
@@ -517,7 +536,7 @@ namespace Pgp
         }
 
         // AES-OCB from rfc 7253, decrypt only. gpg 2.3+ uses it for its AEAD packets (tag 20).
-        // DecryptOcb on line 1320 drives it chunk by chunk
+        // DecryptOcb on line 1345 drives it chunk by chunk
         class Ocb
         {
         public:
@@ -766,6 +785,29 @@ namespace Pgp
 
         // we don't verify signatures, just read key flags, expiry and creation time out of the self sigs.
         // (if someone can edit your key block they can do way worse than this anyway)
+        // walks a signature's subpacket area and hands each one (type, then the raw bytes incl. the type byte)
+        // to 'visit'. throws on junk lengths, the callers catch that
+        template <typename Visit>
+        void ForEachSubpacket(const Bytes& area, Visit visit)
+        {
+            Reader sub(area);
+            while (sub.Remaining() > 0)
+            {
+                uint8_t first = sub.Byte();
+                size_t length = 0;
+                if (first < 192)
+                    length = first;
+                else if (first < 255)
+                    length = ((size_t(first) - 192) << 8) + sub.Byte() + 192;
+                else
+                    length = sub.U32();
+                if (length == 0)
+                    throw Error("The signature is malformed");
+                Bytes data = sub.Take(length);
+                visit(data[0] & 0x7F, data);
+            }
+        }
+
         bool ParseSignature(const Bytes& body, SignatureInfo& info)
         {
             try
@@ -776,21 +818,8 @@ namespace Pgp
                 info.type = reader.Byte();
                 reader.Skip(2);
                 Bytes hashed = reader.Take(reader.U16());
-                Reader sub(hashed);
-                while (sub.Remaining() > 0)
+                ForEachSubpacket(hashed, [&info](int type, const Bytes& data)
                 {
-                    uint8_t first = sub.Byte();
-                    size_t length = 0;
-                    if (first < 192)
-                        length = first;
-                    else if (first < 255)
-                        length = ((size_t(first) - 192) << 8) + sub.Byte() + 192;
-                    else
-                        length = sub.U32();
-                    if (length == 0)
-                        return false;
-                    Bytes data = sub.Take(length);
-                    int type = data[0] & 0x7F;
                     if (type == 2 && data.size() >= 5)
                         info.created = ReadU32(data.data() + 1);
                     else if (type == 9 && data.size() >= 5)
@@ -800,7 +829,7 @@ namespace Pgp
                     }
                     else if (type == 27 && data.size() >= 2)
                         info.flags = data[1];
-                }
+                });
                 return true;
             }
             catch (const Error&)
@@ -896,12 +925,8 @@ namespace Pgp
             }
 
             size_t publicEnd = reader.Position();
-            // v4 fingerprint = sha1 of 0x99, a 2 byte length, then the public part of the packet. key ID is the last 8 bytes
-            Hasher fingerprint(HashAlgorithm::Sha1);
-            uint8_t prefix[3] = { 0x99, static_cast<uint8_t>(publicEnd >> 8), static_cast<uint8_t>(publicEnd) };
-            fingerprint.Update(prefix, 3);
-            fingerprint.Update(packet.body.data(), publicEnd);
-            key.fingerprint = fingerprint.Finish();
+            // v4 fingerprint = sha1 of the KeyHashPrefix form of the public part. key ID is the last 8 bytes
+            key.fingerprint = Hash(HashAlgorithm::Sha1, KeyHashPrefix(packet.body.data(), publicEnd));
             key.keyId.assign(key.fingerprint.end() - 8, key.fingerprint.end());
 
             if (!key.secret || !key.supported)
@@ -1145,7 +1170,7 @@ namespace Pgp
         }
 
         // decrypts the secret half of a key with the passphrase and pulls out the numbers we need.
-        // throws PassphraseError so the UI can ask for it (Application.cpp line 332)
+        // throws PassphraseError so the UI can ask for it (Application.cpp line 590)
         void Unlock(Key& key, std::string_view passphrase)
         {
             if (key.unlocked)
@@ -1227,7 +1252,7 @@ namespace Pgp
             key.unlocked = true;
         }
 
-        // reverse of BuildSessionKeyPacket (line 1098), gets the AES key back out
+        // reverse of BuildSessionKeyPacket (line 1123), gets the AES key back out
         void DecryptSessionKey(const Key& key, const Bytes& fields, SessionKey& session)
         {
             Reader reader(fields);
@@ -1411,9 +1436,127 @@ namespace Pgp
             }
             throw Error("The decrypted message contained no readable data");
         }
+
+        constexpr unsigned GeneratedKeyBits = 3072;
+        constexpr uint8_t SignatureHashSha256 = 8;
+
+        Bytes Concat(std::initializer_list<Bytes> parts)
+        {
+            Bytes out;
+            for (const Bytes& part : parts)
+                Append(out, part);
+            return out;
+        }
+
+        Bytes Subpacket(uint8_t type, const Bytes& data)
+        {
+            Bytes out;
+            out.push_back(static_cast<uint8_t>(data.size() + 1));
+            out.push_back(type);
+            Append(out, data);
+            return out;
+        }
+
+        Bytes RsaPublicBody(const RsaKeyPair& key, uint32_t created)
+        {
+            Bytes body = { 4 };
+            AppendU32(body, created);
+            body.push_back(AlgorithmRsa);
+            WriteMpi(body, key.n);
+            WriteMpi(body, key.e);
+            return body;
+        }
+
+        // the secret half of a generated key. with a passphrase it's protected exactly how gpg does it:
+        // AES-256, iterated + salted sha256 S2K, sha1 check on the end. the S2K/CFB code is shared with Unlock
+        Bytes RsaSecretBody(const Bytes& publicBody, const RsaKeyPair& key, std::string_view passphrase)
+        {
+            Bytes secret;
+            WriteMpi(secret, key.d);
+            WriteMpi(secret, key.p);
+            WriteMpi(secret, key.q);
+            WriteMpi(secret, key.u);
+
+            Bytes body = publicBody;
+            if (passphrase.empty())
+            {
+                body.push_back(0);
+                Append(body, secret);
+                uint16_t sum = Checksum(secret.data(), secret.size());
+                body.push_back(static_cast<uint8_t>(sum >> 8));
+                body.push_back(static_cast<uint8_t>(sum));
+                Wipe(secret);
+                return body;
+            }
+
+            constexpr uint8_t countByte = 0xFF;
+            S2K s2k;
+            s2k.type = 3;
+            s2k.hash = SignatureHashSha256;
+            s2k.salt = RandomBytes(8);
+            s2k.count = size_t(16 + (countByte & 15)) << ((countByte >> 4) + 6);
+
+            Bytes iv = RandomBytes(BlockSize);
+            Bytes derived = DeriveKey(s2k, passphrase, CipherKeyLength(CipherAes256));
+            Aes aes(derived);
+            Wipe(derived);
+            Append(secret, Hash(HashAlgorithm::Sha1, secret));
+            Bytes encrypted = CfbEncrypt(aes, iv.data(), secret);
+            Wipe(secret);
+
+            body.push_back(254);
+            body.push_back(CipherAes256);
+            body.push_back(static_cast<uint8_t>(s2k.type));
+            body.push_back(static_cast<uint8_t>(s2k.hash));
+            Append(body, s2k.salt);
+            body.push_back(countByte);
+            Append(body, iv);
+            Append(body, encrypted);
+            return body;
+        }
+
+        // builds a v4 signature packet. 'hashed' is whatever the signature type covers (key, key + user id,
+        // key + subkey), then the trailer goes on the end like rfc 9580 5.2.4 says. RSA + sha256 only, it's all we make
+        Bytes SignaturePacket(const RsaKeyPair& signer, const Bytes& fingerprint, uint8_t type, const Bytes& hashed, const Bytes& subpackets)
+        {
+            Bytes body = { 4, type, AlgorithmRsa, SignatureHashSha256 };
+            body.push_back(static_cast<uint8_t>(subpackets.size() >> 8));
+            body.push_back(static_cast<uint8_t>(subpackets.size()));
+            Append(body, subpackets);
+
+            Hasher hasher(HashAlgorithm::Sha256);
+            hasher.Update(hashed);
+            hasher.Update(body);
+            Bytes trailer = { 4, 0xFF };
+            AppendU32(trailer, static_cast<uint32_t>(body.size()));
+            hasher.Update(trailer);
+            Bytes digest = hasher.Finish();
+
+            Bytes issuer = Subpacket(16, Bytes(fingerprint.end() - 8, fingerprint.end()));
+            body.push_back(static_cast<uint8_t>(issuer.size() >> 8));
+            body.push_back(static_cast<uint8_t>(issuer.size()));
+            Append(body, issuer);
+            body.push_back(digest[0]);
+            body.push_back(digest[1]);
+            WriteMpi(body, RsaSignSha256(signer, digest));
+            return body;
+        }
+
+        std::string FormatFingerprint(const Bytes& fingerprint)
+        {
+            std::string hex = Hex(fingerprint);
+            std::string out;
+            for (size_t i = 0; i < hex.size(); i += 4)
+            {
+                if (i)
+                    out += i == 20 ? "  " : " ";
+                out += hex.substr(i, 4);
+            }
+            return out;
+        }
     }
 
-    // the Encrypt button ends up here (Application.cpp line 437).
+    // the Encrypt button ends up here (Application.cpp line 733).
     // random AES-256 key -> wrap it for the recipient -> encrypt literal packet + MDC with it -> armor
     EncryptResult EncryptMessage(std::string_view message, std::string_view publicKey)
     {
@@ -1581,6 +1724,46 @@ namespace Pgp
         throw Error(lastError.empty() ? "The message could not be decrypted" : lastError);
     }
 
+    // reads a revocation certificate (with or without gpg's safety colon) and says which key it revokes.
+    // My PGP uses this so you can't save a revocation for some other key next to yours
+    std::string RevocationKeyId(std::string_view text)
+    {
+        if (IsBlank(text))
+            throw Error("No revocation certificate was entered");
+        std::string cleaned(text);
+        size_t colon = cleaned.find(":-----BEGIN PGP");
+        if (colon != std::string::npos)
+            cleaned.erase(colon, 1);
+
+        std::string type;
+        Bytes data = Dearmor(cleaned, type);
+        for (const Packet& packet : ReadPackets(data.data(), data.size()))
+        {
+            if (packet.tag != TagSignature)
+                continue;
+            Reader reader(packet.body);
+            if (reader.Byte() != 4 || reader.Byte() != 0x20)
+                continue;
+            reader.Skip(2);
+            Bytes hashed = reader.Take(reader.U16());
+            Bytes unhashed = reader.Take(reader.U16());
+
+            Bytes keyId;
+            auto visit = [&keyId](int subtype, const Bytes& sub)
+            {
+                if (subtype == 33 && sub.size() == 22 && sub[1] == 4)
+                    keyId.assign(sub.end() - 8, sub.end());
+                else if (subtype == 16 && sub.size() == 9 && keyId.empty())
+                    keyId.assign(sub.begin() + 1, sub.end());
+            };
+            ForEachSubpacket(hashed, visit);
+            ForEachSubpacket(unhashed, visit);
+            if (!keyId.empty())
+                return Hex(keyId);
+        }
+        throw Error("That isn't a key revocation certificate");
+    }
+
     // lightweight ParseKeyring for the My PGP tab, just says what kind of key got pasted
     KeyInfo InspectKey(std::string_view armored)
     {
@@ -1592,5 +1775,112 @@ namespace Pgp
         info.userId = ring.userId;
         info.keyId = Hex(ring.keys.front().keyId);
         return info;
+    }
+
+    // the Generate Keys button ends up here (on a background thread so the window doesn't freeze).
+    // makes an RSA primary key for certifying/signing, an RSA subkey for encryption, signs the user id and
+    // the subkey with the primary, and makes a revocation certificate while we still have the private key handy
+    GeneratedKey GenerateKey(std::string_view name, std::string_view email, std::string_view passphrase)
+    {
+        std::string userId(Trim(name));
+        std::string_view address = Trim(email);
+        if (!address.empty())
+        {
+            if (!userId.empty())
+                userId += ' ';
+            userId += "<" + std::string(address) + ">";
+        }
+        if (userId.empty())
+            throw Error("Enter a name or email for the key");
+
+        uint32_t created = static_cast<uint32_t>(std::time(nullptr));
+        RsaKeyPair primary = RsaGenerate(GeneratedKeyBits);
+        RsaKeyPair subkey = RsaGenerate(GeneratedKeyBits);
+
+        Bytes primaryPublic = RsaPublicBody(primary, created);
+        Bytes subkeyPublic = RsaPublicBody(subkey, created);
+        Bytes primaryPrefix = KeyHashPrefix(primaryPublic.data(), primaryPublic.size());
+        Bytes fingerprint = Hash(HashAlgorithm::Sha1, primaryPrefix);
+
+        Bytes time;
+        AppendU32(time, created);
+        Bytes issuerFingerprint = Concat({ Bytes{ 4 }, fingerprint });
+        Bytes userIdBytes(userId.begin(), userId.end());
+
+        Bytes userIdHashed = primaryPrefix;
+        userIdHashed.push_back(0xB4);
+        AppendU32(userIdHashed, static_cast<uint32_t>(userIdBytes.size()));
+        Append(userIdHashed, userIdBytes);
+        // positive certification of the user id. key flags = certify + sign, then preferences:
+        // AES256/192/128, SHA512/384/256, ZLIB/ZIP/none, MDC support, and "keyservers don't modify this"
+        Bytes certification = SignaturePacket(primary, fingerprint, 0x13, userIdHashed, Concat({
+            Subpacket(2, time),
+            Subpacket(27, { 0x03 }),
+            Subpacket(11, { 9, 8, 7 }),
+            Subpacket(21, { 10, 9, 8 }),
+            Subpacket(22, { 2, 1, 0 }),
+            Subpacket(30, { 0x01 }),
+            Subpacket(23, { 0x80 }),
+            Subpacket(33, issuerFingerprint),
+        }));
+
+        // subkey binding, flags = encrypt communications + encrypt storage
+        Bytes binding = SignaturePacket(primary, fingerprint, 0x18, Concat({ primaryPrefix, KeyHashPrefix(subkeyPublic.data(), subkeyPublic.size()) }), Concat({
+            Subpacket(2, time),
+            Subpacket(27, { 0x0C }),
+            Subpacket(33, issuerFingerprint),
+        }));
+
+        // key revocation, reason 0 = no reason given. same thing gpg pre-makes when you create a key
+        Bytes revocation = SignaturePacket(primary, fingerprint, 0x20, primaryPrefix, Concat({
+            Subpacket(2, time),
+            Subpacket(29, { 0x00 }),
+            Subpacket(33, issuerFingerprint),
+        }));
+
+        Bytes publicBlock;
+        WritePacket(publicBlock, TagPublicKey, primaryPublic);
+        WritePacket(publicBlock, TagUserId, userIdBytes);
+        WritePacket(publicBlock, TagSignature, certification);
+        WritePacket(publicBlock, TagPublicSubkey, subkeyPublic);
+        WritePacket(publicBlock, TagSignature, binding);
+
+        Bytes primarySecret = RsaSecretBody(primaryPublic, primary, passphrase);
+        Bytes subkeySecret = RsaSecretBody(subkeyPublic, subkey, passphrase);
+        Bytes secretBlock;
+        WritePacket(secretBlock, TagSecretKey, primarySecret);
+        WritePacket(secretBlock, TagUserId, userIdBytes);
+        WritePacket(secretBlock, TagSignature, certification);
+        WritePacket(secretBlock, TagSecretSubkey, subkeySecret);
+        WritePacket(secretBlock, TagSignature, binding);
+        Wipe(primarySecret);
+        Wipe(subkeySecret);
+
+        Bytes revocationBlock;
+        WritePacket(revocationBlock, TagSignature, revocation);
+
+        GeneratedKey result;
+        result.userId = userId;
+        result.fingerprint = FormatFingerprint(fingerprint);
+        result.publicKey = Armor(publicBlock, "PGP PUBLIC KEY BLOCK");
+        result.privateKey = Armor(secretBlock, "PGP PRIVATE KEY BLOCK");
+        Wipe(secretBlock);
+
+        // the colon in front of BEGIN is the same trick gpg uses so nobody imports this by accident,
+        // our own Dearmor won't read it either until the colon's gone
+        result.revocation =
+            "This is a revocation certificate for the PGP key\n"
+            "  " + userId + "\n"
+            "  Fingerprint: " + result.fingerprint + "\n"
+            "\n"
+            "If your private key is ever lost or stolen, publishing this certificate tells\n"
+            "everyone that the key must not be used any more. A published revocation can't\n"
+            "be taken back, so keep this file somewhere safe and private.\n"
+            "\n"
+            "To stop it being imported by accident there's a colon in front of the BEGIN\n"
+            "line below. Delete that colon before you import or publish it.\n"
+            "\n"
+            ":" + Armor(revocationBlock, "PGP PUBLIC KEY BLOCK", "This is a revocation certificate");
+        return result;
     }
 }

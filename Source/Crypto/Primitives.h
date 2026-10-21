@@ -72,6 +72,28 @@ namespace Pgp
     Bytes RsaEncrypt(const Bytes& modulus, const Bytes& exponent, const Bytes& message);
     Bytes RsaDecrypt(const Bytes& modulus, const Bytes& exponent, const Bytes& prime1, const Bytes& prime2, const Bytes& ciphertext);
 
+    struct RsaKeyPair
+    {
+        Bytes n;
+        Bytes e;
+        Bytes d;
+        Bytes p;
+        Bytes q;
+        Bytes u;
+
+        RsaKeyPair() = default;
+        RsaKeyPair(RsaKeyPair&&) = default;
+        RsaKeyPair& operator=(RsaKeyPair&&) = default;
+        RsaKeyPair(const RsaKeyPair&) = delete;
+        RsaKeyPair& operator=(const RsaKeyPair&) = delete;
+        ~RsaKeyPair();
+    };
+
+    // makes a fresh RSA key in the shape openpgp wants: p < q and u = p^-1 mod q
+    RsaKeyPair RsaGenerate(unsigned bits);
+    // PKCS#1 v1.5 signature over a sha256 digest, what our self-signatures use
+    Bytes RsaSignSha256(const RsaKeyPair& key, const Bytes& digest);
+
     // zero stuff out before it gets freed so keys don't just hang around in ram
     void WipeMemory(void* data, size_t size);
     void Wipe(Bytes& data);

@@ -27,6 +27,9 @@
     <ClCompile Include="App\Application.cpp">
       <Filter>App</Filter>
     </ClCompile>
+    <ClCompile Include="App\FileExport.cpp">
+      <Filter>App</Filter>
+    </ClCompile>
     <ClCompile Include="App\Main.cpp">
       <Filter>App</Filter>
     </ClCompile>
@@ -81,6 +84,9 @@
       <Filter>Resources</Filter>
     </ClInclude>
     <ClInclude Include="App\Application.h">
+      <Filter>App</Filter>
+    </ClInclude>
+    <ClInclude Include="App\FileExport.h">
       <Filter>App</Filter>
     </ClInclude>
     <ClInclude Include="App\ProfileStore.h">

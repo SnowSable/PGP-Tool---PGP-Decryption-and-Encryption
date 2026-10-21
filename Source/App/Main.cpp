@@ -132,7 +132,7 @@ namespace
             info->ptMinTrackSize.y = static_cast<LONG>(MinimumHeight * dpiScale);
             return 0;
         }
-        // moved onto a monitor with different scaling, resize the window and redo the theme next frame (line 248)
+        // moved onto a monitor with different scaling, resize the window and redo the theme next frame (line 252)
         case WM_DPICHANGED:
         {
             pendingDpiScale = HIWORD(wParam) / 96.0f;
