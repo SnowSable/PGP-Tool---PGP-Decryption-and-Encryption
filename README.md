@@ -94,30 +94,6 @@ no packages to install, imgui is already in `Source/Vendor/ImGui`, and everythin
 
 
 
-## tests
-
-the solution has a second project, `PGPToolTests`. build it and run:
-
-```
-Source\Bin\Release\PGPToolTests.exe
-```
-
-24 tests: the RFC 7748 X25519 vectors, round trips with every key type, real gpg messages (zlib, zip, OCB, signed, hidden recipient), tampered messages, wrong / missing passphrases, keys pasted in the wrong box, all that.
-
-the gpg keys and messages the tests use are baked into `Source/Tests/Fixtures.h` so you don't need gpg to run them. if you want fresh ones, run this from git bash (needs gpg on the PATH, git bash already has it):
-
-```
-TMPDIR=/c/tmp bash Source/Tests/GenerateFixtures.sh
-```
-
-(keep TMPDIR short, gpg-agent falls over if its socket path is too long)
-
-the keys in there are throwaway test keys with passwords like `alice pass`, don't use them for anything real lol
-
----
-
-
-
 ## how the code is laid out
 
 ```
@@ -125,7 +101,7 @@ PGPTool.sln
 Source/
   App/            window, UI, the saved profile stuff
   Crypto/         all the OpenPGP stuff, no UI code in here
-  Tests/          test runner + gpg fixtures
+  Resources/      app icon + version info
   Vendor/ImGui/   dear imgui, untouched
   Docs/           screenshots for this readme
 ```

@@ -1,4 +1,4 @@
-Required Notice: Copyright (c) 2026 YOUR NAME
+Required Notice: Copyright (c) 2026 SnowSable
 
 This license covers PGP Tool's own code. Dear ImGui (Source/Vendor/ImGui) is
 under its own MIT license, see Source/Vendor/ImGui/LICENSE.txt.

@@ -7,6 +7,9 @@
     <Filter Include="Crypto">
       <UniqueIdentifier>{7B2F4A1C-3D5E-4F9B-8C2A-4E6D8F0B2C31}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Resources">
+      <UniqueIdentifier>{4C9A1B8D-0E2F-4A6C-9D9B-1F3E5A7C9DA8}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Vendor">
       <UniqueIdentifier>{8C3A5B2D-4E6F-4A0C-9D3B-5F7E9A1C3D42}</UniqueIdentifier>
     </Filter>
@@ -74,6 +77,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Resources\Resource.h">
+      <Filter>Resources</Filter>
+    </ClInclude>
     <ClInclude Include="App\Application.h">
       <Filter>App</Filter>
     </ClInclude>
@@ -128,5 +134,15 @@
     <ClInclude Include="Vendor\ImGui\Misc\imgui_stdlib.h">
       <Filter>Vendor\ImGui\Misc</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Resources\App.rc">
+      <Filter>Resources</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Resources\App.ico">
+      <Filter>Resources</Filter>
+    </Image>
   </ItemGroup>
 </Project>

@@ -123,7 +123,7 @@ namespace Pgp
     }
 
     // the actual montgomery ladder, scalar gets clamped like rfc 7748 says.
-    // checked against the rfc vectors in Tests/TestMain.cpp line 99
+    // checked against the test vectors in rfc 7748 section 5.2
     void X25519(uint8_t output[32], const uint8_t scalar[32], const uint8_t point[32])
     {
         uint8_t z[32];
@@ -163,7 +163,7 @@ namespace Pgp
             Subtract(c, d, f);
             Multiply(a, c, Constant121665);
             Add(a, a, d);
-            // this was c*f in the first draft and broke everything lol, the rfc vector test caught it
+            // this was c*f in the first draft and broke everything lol, the rfc test vectors caught it
             Multiply(c, c, a);
             Multiply(a, d, f);
             Multiply(d, b, x);
